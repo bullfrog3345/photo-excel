@@ -6,7 +6,7 @@
 - 엑셀의 {{이미지}} / {{이미지:파일명}} 표식 칸과 기존 사진 자리를 찾아 사진을 연결·삽입
 - 사진 촬영(카메라) → 선택한 칸에 바로 연결, 다음 빈 칸으로 자동 이동
 - A1 회사 로고 보호, 인쇄 영역 밖 칸 제외, 기존 사진 교체/삭제 예약, EXIF 회전 보정
-필요 라이브러리: streamlit, openpyxl, pillow
+필요 라이브러리: streamlit, openpyxl, pillow, streamlit-back-camera-input(후면 카메라)
 """
 from __future__ import annotations
 
@@ -29,6 +29,12 @@ from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.utils import column_index_from_string, get_column_letter, range_boundaries
 from openpyxl.utils.units import pixels_to_EMU
 from PIL import Image, ImageOps
+
+try:  # 후면 카메라용 부품 (없으면 기본 카메라로 자동 대체)
+    from streamlit_back_camera_input import back_camera_input
+    HAS_BACK_CAM = True
+except Exception:
+    HAS_BACK_CAM = False
 
 # ─────────────────────────────── 상수 ───────────────────────────────
 VERSION = "3.0-web"
@@ -448,7 +454,17 @@ def camera_section(slots: List[dict], upload_names: List[str]):
             value=suggest_photo_name(slots, tgt, taken),
             key=f"camname_{ss.cam_n}_{tgt}_{ss.ver}",
         )
-        shot = st.camera_input("셔터를 누르면 저장됩니다", key=f"cam_{ss.cam_n}", label_visibility="collapsed")
+        rear = True
+        if HAS_BACK_CAM:
+            rear = st.radio(
+                "카메라 방향", ["후면 카메라 (권장)", "전면 카메라"], horizontal=True, key="cam_side",
+            ).startswith("후면")
+        else:
+            st.caption("⚠ 후면 카메라 부품이 설치되지 않아 기본(전면) 카메라를 사용합니다. requirements.txt를 확인하세요.")
+        if HAS_BACK_CAM and rear:
+            shot = back_camera_input(height=450, width=480, key=f"bcam_{ss.cam_n}")
+        else:
+            shot = st.camera_input("셔터를 누르면 저장됩니다", key=f"cam_{ss.cam_n}", label_visibility="collapsed")
         if shot is not None:
             try:
                 data = normalize_photo(shot.getvalue())
