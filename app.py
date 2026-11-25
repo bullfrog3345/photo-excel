@@ -4,7 +4,7 @@
 
 원본(Windows + Excel + tkinter)의 '사진 연결' 화면을 웹으로 옮긴 버전입니다.
 - 엑셀의 {{이미지}} / {{이미지:파일명}} 표식 칸과 기존 사진 자리를 찾아 사진을 연결·삽입
-- ①에서 칸을 누르면 굵은 테두리로 표시, ②에서 사진을 누르면 그 칸에 연결 (드롭다운 없음)
+- ①에서 칸을 누르면 굵은 테두리로 표시, ②에서 사진을 누르면 그 칸에 연결 (버튼·드롭다운 없음)
 - A1 회사 로고 보호, 인쇄 영역 밖 칸 제외, 기존 사진 교체/삭제 예약, EXIF 회전 보정
 필요 라이브러리: streamlit, openpyxl, pillow, pillow-heif(아이패드 HEIC 사진)
 """
@@ -399,9 +399,35 @@ def slot_box(i: int):
         return st.container(border=True)
 
 
-def highlight_css(active: int):
+def photo_box(idx: int):
+    try:
+        return st.container(border=True, key=f"photo_{idx}")
+    except TypeError:
+        return st.container(border=True)
+
+
+def ui_css(active: int):
+    """① 칸 카드와 ② 사진 카드 전체를 '눌러지는 영역'으로 만듭니다.
+    (카드 안에 투명한 버튼을 카드 크기로 펼쳐 놓는 방식 - 화면에는 버튼이 보이지 않습니다.)"""
     st.markdown(
         f"""<style>
+        /* 카드 기준 위치 */
+        [class*="st-key-slot_"], [class*="st-key-photo_"] {{ position: relative; }}
+        /* 투명 버튼을 카드 전체로 확장 */
+        [class*="st-key-selslot_"], [class*="st-key-pickbtn_"] {{
+            position: absolute !important; inset: 0; width: 100% !important; height: 100% !important;
+            z-index: 10; margin: 0 !important;
+        }}
+        [class*="st-key-selslot_"] button, [class*="st-key-pickbtn_"] button {{
+            width: 100%; height: 100%; opacity: 0; cursor: pointer;
+        }}
+        /* 카드 안의 '연결 해제', '기존 사진 삭제'는 위에 두어 따로 누를 수 있게 */
+        [class*="st-key-unlink_"], [class*="st-key-del_"] {{ position: relative; z-index: 20; }}
+        /* 손가락/마우스가 올라간 카드 표시 */
+        [class*="st-key-slot_"]:hover, [class*="st-key-photo_"]:hover {{
+            box-shadow: 0 0 0 2px rgba(255, 75, 75, 0.45);
+        }}
+        /* 선택된 칸 */
         .st-key-slot_{active} {{
             border: 4px solid #ff4b4b !important;
             box-shadow: 0 0 0 3px rgba(255, 75, 75, 0.35);
@@ -513,22 +539,20 @@ def main():
         st.markdown(f"**요약:** 칸 {len(slots)}개 · 연결 {linked}개 · 비어 있는 칸 {blank}개 · 사진 {len(photo_names)}장")
 
     ss.pick_target = max(0, min(ss.pick_target, len(slots) - 1))
-    highlight_css(ss.pick_target)
+    ui_css(ss.pick_target)
 
     left, right = st.columns([1.3, 1.0], gap="large")
 
     with left:
         st.subheader("① 엑셀 사진 위치")
-        st.caption("사진을 넣을 칸의 **'이 칸 선택'**을 누르면 빨간 굵은 테두리로 표시됩니다.")
+        st.caption("사진을 넣을 **칸을 누르면** 빨간 굵은 테두리로 표시됩니다.")
         for i, s in enumerate(slots):
-            active = i == ss.pick_target
             linked_name = ss.assignments.get(i)
             with slot_box(i):
+                st.button("선택", key=f"selslot_{i}", on_click=select_slot, args=(i,))  # 화면에는 안 보이는 투명 버튼
                 a, b = st.columns([1.4, 1.0])
                 with a:
                     st.markdown(f"**{slot_title(i, s)}**")
-                    if active:
-                        st.markdown("🔴 **선택된 칸**")
                     if linked_name:
                         st.caption(f"연결: {linked_name}")
                     elif s["existing"] and i in ss.deletes:
@@ -537,11 +561,6 @@ def main():
                         st.caption("기존 사진 있음")
                     else:
                         st.caption("비어 있음")
-                    st.button(
-                        "✔ 선택된 칸" if active else "이 칸 선택", key=f"selslot_{i}",
-                        type="primary" if active else "secondary",
-                        on_click=select_slot, args=(i,),
-                    )
                     if linked_name:
                         st.button("연결 해제", key=f"unlink_{i}_{ss.ver}", on_click=unassign, args=(i,))
                     elif s["existing"]:
@@ -562,13 +581,13 @@ def main():
         if not photo_names:
             st.info("사진을 올리면 여기에 미리보기가 표시됩니다.")
         else:
-            st.info(f"🔴 선택된 칸: {slot_title(ss.pick_target, slots[ss.pick_target])}\n\n아래 사진의 **'이 사진 넣기'**를 누르면 이 칸에 들어갑니다.")
             st.checkbox("넣은 뒤 다음 빈 칸으로 이동", value=True, key="auto_next")
             used_by = {v: k + 1 for k, v in ss.assignments.items()}
             cols = st.columns(2)
             for idx, n in enumerate(photo_names):
                 with cols[idx % 2]:
-                    with st.container(border=True):
+                    with photo_box(idx):
+                        st.button("선택", key=f"pickbtn_{idx}", on_click=pick_photo, args=(n,))  # 투명 버튼
                         t = get_thumb(n, photo_map[n])
                         if t:
                             st.image(t)
@@ -577,7 +596,6 @@ def main():
                         st.caption(n)
                         if n in used_by:
                             st.success(f"✓ {used_by[n]}번 칸에 연결됨")
-                        st.button("이 사진 넣기", key=f"pickbtn_{idx}_{ss.ver}", on_click=pick_photo, args=(n,))
 
     st.divider()
     b1, b2 = st.columns(2)
