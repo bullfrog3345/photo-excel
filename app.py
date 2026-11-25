@@ -506,24 +506,31 @@ def main():
     st.title("🖼 엑셀 사진 원스톱")
     st.caption(f"v{VERSION} · 엑셀의 사진 위치를 찾아 사진을 연결하고 한 번에 삽입·저장합니다. (아이패드 Safari 지원)")
 
-    up1, up2 = st.columns(2)
+    up1, up2 = st.columns([1, 1.5])
     with up1:
         up_excel = st.file_uploader(
             "① 대상 엑셀 (.xlsx)", type=["xlsx", "xlsm"],
             help="사진 넣을 칸에 {{이미지}} 또는 {{이미지:파일명.jpg}}가 적힌 엑셀",
         )
-    folder_val = None
-    with up2:
-        if HAS_FOLDER_PICKER:
-            folder_val = _folder_picker(key="folder_picker", default=None)
-        else:
-            st.caption("⚠ folder_picker 폴더가 없어 '폴더 선택'을 쓸 수 없습니다. GitHub에 folder_picker 폴더도 올려 주세요.")
-        up_photos = st.file_uploader(
+
+    def photo_uploader():
+        return st.file_uploader(
             "② 점검 사진 (여러 장 선택 가능)", type=list(IMG_EXT), accept_multiple_files=True,
             help="아이패드 사진(HEIC)도 올릴 수 있습니다. 올린 사진은 아래 '② 사진 목록'에서 미리 보고 선택합니다.",
         )
+
+    folder_val = None
+    with up2:
         if HAS_FOLDER_PICKER:
+            c_up, c_fold = st.columns([3, 1])      # Upload 버튼 오른쪽에 '폴더 선택'
+            with c_up:
+                up_photos = photo_uploader()
+            with c_fold:
+                folder_val = _folder_picker(key="folder_picker", default=None)
             st.caption("📁 폴더 선택: 폴더 안의 사진을 한 번에 불러옵니다(긴 변 1600px로 축소). 기기에 따라 폴더 대신 사진 여러 장 선택 창이 열릴 수 있습니다.")
+        else:
+            up_photos = photo_uploader()
+            st.caption("⚠ folder_picker 폴더가 없어 '폴더 선택'을 쓸 수 없습니다. GitHub에 folder_picker 폴더도 올려 주세요.")
 
     upload_map: Dict[str, bytes] = {}
     for f in sorted(up_photos or [], key=lambda f: natural_key(f.name)):
