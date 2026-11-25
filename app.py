@@ -454,21 +454,25 @@ def camera_section(slots: List[dict], upload_names: List[str]):
             value=suggest_photo_name(slots, tgt, taken),
             key=f"camname_{ss.cam_n}_{tgt}_{ss.ver}",
         )
-        rear = True
-        if HAS_BACK_CAM:
-            # 안드로이드는 기본 카메라에 전·후면 전환 버튼이 생기므로 그쪽을 기본으로, 아이패드는 후면 전용을 기본으로
-            try:
-                ua = str(st.context.headers.get("User-Agent", ""))
-            except Exception:
-                ua = ""
-            side_opts = ["후면 카메라 (권장)", "기본 카메라 (전·후면 전환 버튼)"]
-            rear = st.radio(
-                "카메라 방식", side_opts, index=1 if "Android" in ua else 0,
-                horizontal=True, key="cam_side",
-            ).startswith("후면")
-        else:
-            st.caption("⚠ 후면 카메라 부품이 설치되지 않아 기본(전면) 카메라를 사용합니다. requirements.txt를 확인하세요.")
-        if HAS_BACK_CAM and rear:
+        OPT_NATIVE = "기기 카메라 앱 (후면·고화질, 아이패드 권장)"
+        OPT_REAR = "앱 내 후면 카메라 (영상을 터치하면 촬영)"
+        OPT_DEFAULT = "기본 카메라 (기기에 따라 전·후면 전환 버튼)"
+        opts = [OPT_NATIVE] + ([OPT_REAR] if HAS_BACK_CAM else []) + [OPT_DEFAULT]
+        try:  # 안드로이드는 기본 카메라에 전환 버튼이 생기므로 그쪽을 먼저 선택
+            ua = str(st.context.headers.get("User-Agent", ""))
+        except Exception:
+            ua = ""
+        mode = st.radio(
+            "카메라 방식", opts, index=opts.index(OPT_DEFAULT) if "Android" in ua else 0,
+            horizontal=False, key="cam_side",
+        )
+        if mode == OPT_NATIVE:
+            st.caption("아래 칸을 누르고 **‘사진 찍기’**를 고르면 기기의 카메라 앱이 열립니다(후면). 찍은 뒤 **‘사진 사용’**을 누르면 저장됩니다.")
+            shot = st.file_uploader(
+                "카메라 앱으로 촬영", type=list(IMG_EXT), key=f"native_{ss.cam_n}", label_visibility="collapsed",
+            )
+        elif mode == OPT_REAR:
+            st.caption("카메라 화면(영상)을 **한 번 터치**하면 촬영됩니다.")
             shot = back_camera_input(height=450, width=480, key=f"bcam_{ss.cam_n}")
         else:
             shot = st.camera_input("셔터를 누르면 저장됩니다", key=f"cam_{ss.cam_n}", label_visibility="collapsed")
