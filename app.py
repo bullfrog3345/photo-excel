@@ -456,8 +456,15 @@ def camera_section(slots: List[dict], upload_names: List[str]):
         )
         rear = True
         if HAS_BACK_CAM:
+            # 안드로이드는 기본 카메라에 전·후면 전환 버튼이 생기므로 그쪽을 기본으로, 아이패드는 후면 전용을 기본으로
+            try:
+                ua = str(st.context.headers.get("User-Agent", ""))
+            except Exception:
+                ua = ""
+            side_opts = ["후면 카메라 (권장)", "기본 카메라 (전·후면 전환 버튼)"]
             rear = st.radio(
-                "카메라 방향", ["후면 카메라 (권장)", "전면 카메라"], horizontal=True, key="cam_side",
+                "카메라 방식", side_opts, index=1 if "Android" in ua else 0,
+                horizontal=True, key="cam_side",
             ).startswith("후면")
         else:
             st.caption("⚠ 후면 카메라 부품이 설치되지 않아 기본(전면) 카메라를 사용합니다. requirements.txt를 확인하세요.")
