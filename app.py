@@ -4,13 +4,12 @@
 
 원본(Windows + Excel + tkinter)의 '사진 연결' 화면을 웹으로 옮긴 버전입니다.
 - 엑셀의 {{이미지}} / {{이미지:파일명}} 표식 칸과 기존 사진 자리를 찾아 사진을 연결·삽입
-- ①에서 칸을 누르면 굵은 테두리로 표시, ②에서 사진을 누르면 그 칸에 연결 (버튼·드롭다운 없음)
+- 사진 미리보기에서 '이 사진 선택' 버튼으로 칸에 연결, 다음 빈 칸으로 자동 이동
 - A1 회사 로고 보호, 인쇄 영역 밖 칸 제외, 기존 사진 교체/삭제 예약, EXIF 회전 보정
 필요 라이브러리: streamlit, openpyxl, pillow, pillow-heif(아이패드 HEIC 사진)
 """
 from __future__ import annotations
 
-import base64
 import io
 import re
 from pathlib import Path
@@ -18,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 import streamlit as st
-import streamlit.components.v1 as components
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import (
     AnchorMarker,
@@ -35,16 +33,6 @@ try:  # 아이패드 사진(HEIC) 읽기 지원 (없어도 JPG/PNG는 정상 동
     register_heif_opener()
 except Exception:
     pass
-
-# 폴더 선택 부품 (app.py와 같은 위치의 folder_picker 폴더가 필요)
-try:
-    _folder_picker = components.declare_component(
-        "folder_picker", path=str(Path(__file__).parent / "folder_picker")
-    )
-    HAS_FOLDER_PICKER = True
-except Exception:
-    _folder_picker = None
-    HAS_FOLDER_PICKER = False
 
 # ─────────────────────────────── 상수 ───────────────────────────────
 VERSION = "3.0-web"
@@ -356,7 +344,7 @@ def init_state():
     defaults = {
         "excel_bytes": None, "excel_name": "", "slots": [],
         "assignments": {}, "deletes": set(), "ver": 0,
-        "pick_target": 0, "folder_photos": {}, "folder_last_id": None,
+        "pick_target": 0,
         "upload_sig": None, "result_bytes": None, "thumbs": {},
     }
     for k, v in defaults.items():
@@ -377,112 +365,6 @@ def assign(slot: int, name: str):
     a[slot] = name
     st.session_state.deletes.discard(slot)
     bump()
-
-
-def select_slot(i: int):
-    st.session_state.pick_target = i
-
-
-def unassign(i: int):
-    st.session_state.assignments.pop(i, None)
-    bump()
-
-
-def pick_photo(name: str):
-    """사진 목록에서 사진을 누르면, 선택된 칸에 연결합니다(필요하면 다음 빈 칸으로 이동)."""
-    ss = st.session_state
-    n = len(ss.slots)
-    if not n:
-        return
-    tgt = min(ss.pick_target, n - 1)
-    assign(tgt, name)
-    if ss.get("auto_next", True):
-        order = list(range(tgt + 1, n)) + list(range(0, tgt))
-        nxt = next((k for k in order if k not in ss.assignments and k not in ss.deletes), None)
-        if nxt is not None:
-            ss.pick_target = nxt
-
-
-def slot_box(i: int):
-    """칸 카드를 만듭니다. key를 달아 두면 선택된 칸만 굵은 테두리로 표시할 수 있습니다."""
-    try:
-        return st.container(border=True, key=f"slot_{i}")
-    except TypeError:  # 오래된 Streamlit 버전
-        return st.container(border=True)
-
-
-def photo_box(idx: int):
-    try:
-        return st.container(border=True, key=f"photo_{idx}")
-    except TypeError:
-        return st.container(border=True)
-
-
-def ui_css(active: int):
-    """① 칸 카드와 ② 사진 카드 전체를 '눌러지는 영역'으로 만듭니다.
-    (카드 안에 투명한 버튼을 카드 크기로 펼쳐 놓는 방식 - 화면에는 버튼이 보이지 않습니다.)"""
-    st.markdown(
-        f"""<style>
-        /* 카드 기준 위치 */
-        [class*="st-key-slot_"], [class*="st-key-photo_"] {{ position: relative; }}
-        /* 투명 버튼을 카드 전체로 확장 */
-        [class*="st-key-selslot_"], [class*="st-key-pickbtn_"] {{
-            position: absolute !important; inset: 0; width: 100% !important; height: 100% !important;
-            z-index: 10; margin: 0 !important;
-        }}
-        [class*="st-key-selslot_"] button, [class*="st-key-pickbtn_"] button {{
-            width: 100%; height: 100%; opacity: 0; cursor: pointer;
-        }}
-        /* 카드 안의 '연결 해제', '기존 사진 삭제'는 위에 두어 따로 누를 수 있게 */
-        [class*="st-key-unlink_"], [class*="st-key-del_"] {{ position: relative; z-index: 20; }}
-        /* 손가락/마우스가 올라간 카드 표시 */
-        [class*="st-key-slot_"]:hover, [class*="st-key-photo_"]:hover {{
-            box-shadow: 0 0 0 2px rgba(255, 75, 75, 0.45);
-        }}
-        /* 선택된 칸 */
-        .st-key-slot_{active} {{
-            border: 4px solid #ff4b4b !important;
-            box-shadow: 0 0 0 3px rgba(255, 75, 75, 0.35);
-            background: rgba(255, 75, 75, 0.06);
-        }}
-        </style>""",
-        unsafe_allow_html=True,
-    )
-
-
-def unique_name(name: str, taken: set) -> str:
-    low = {t.casefold() for t in taken}
-    if name.casefold() not in low:
-        return name
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    n = 1
-    while True:
-        cand = f"{stem}_{n}" + (f".{ext}" if ext else "")
-        if cand.casefold() not in low:
-            return cand
-        n += 1
-
-
-def ingest_folder_value(val, upload_names) -> Tuple[int, List[str]]:
-    """폴더 선택 부품이 보내 온 사진을 세션에 추가합니다. (같은 선택은 한 번만 처리)"""
-    ss = st.session_state
-    if not isinstance(val, dict) or not val.get("id") or val["id"] == ss.folder_last_id:
-        return 0, []
-    ss.folder_last_id = val["id"]
-    added = 0
-    failed = list(val.get("failed") or [])
-    for f in val.get("files") or []:
-        try:
-            raw = base64.b64decode(str(f["data"]).split(",", 1)[1])
-        except Exception:
-            failed.append(str(f.get("name", "?")))
-            continue
-        name = unique_name(str(f["name"]), set(ss.folder_photos) | set(upload_names))
-        ss.folder_photos[name] = raw
-        added += 1
-    return added, failed
 
 
 def get_thumb(name: str, data: bytes) -> Optional[bytes]:
@@ -506,48 +388,21 @@ def main():
     st.title("🖼 엑셀 사진 원스톱")
     st.caption(f"v{VERSION} · 엑셀의 사진 위치를 찾아 사진을 연결하고 한 번에 삽입·저장합니다. (아이패드 Safari 지원)")
 
-    up1, up2 = st.columns([1, 1.5])
+    up1, up2 = st.columns(2)
     with up1:
         up_excel = st.file_uploader(
             "① 대상 엑셀 (.xlsx)", type=["xlsx", "xlsm"],
             help="사진 넣을 칸에 {{이미지}} 또는 {{이미지:파일명.jpg}}가 적힌 엑셀",
         )
-
-    def photo_uploader():
-        return st.file_uploader(
+    with up2:
+        up_photos = st.file_uploader(
             "② 점검 사진 (여러 장 선택 가능)", type=list(IMG_EXT), accept_multiple_files=True,
             help="아이패드 사진(HEIC)도 올릴 수 있습니다. 올린 사진은 아래 '② 사진 목록'에서 미리 보고 선택합니다.",
         )
 
-    folder_val = None
-    with up2:
-        if HAS_FOLDER_PICKER:
-            c_up, c_fold = st.columns([3, 1])      # Upload 버튼 오른쪽에 '폴더 선택'
-            with c_up:
-                up_photos = photo_uploader()
-            with c_fold:
-                folder_val = _folder_picker(key="folder_picker", default=None)
-            st.caption("📁 폴더 선택: 폴더 안의 사진을 한 번에 불러옵니다(긴 변 1600px로 축소). 기기에 따라 폴더 대신 사진 여러 장 선택 창이 열릴 수 있습니다.")
-        else:
-            up_photos = photo_uploader()
-            st.caption("⚠ folder_picker 폴더가 없어 '폴더 선택'을 쓸 수 없습니다. GitHub에 folder_picker 폴더도 올려 주세요.")
-
     upload_map: Dict[str, bytes] = {}
     for f in sorted(up_photos or [], key=lambda f: natural_key(f.name)):
         upload_map[f.name] = f.getvalue()
-
-    added, failed = ingest_folder_value(folder_val, list(upload_map))
-    if added:
-        st.success(f"폴더에서 사진 {added}장을 불러왔습니다.")
-    if failed:
-        st.warning("불러오지 못한 사진: " + ", ".join(failed))
-    if ss.folder_photos:
-        fc1, fc2 = st.columns([3, 1])
-        fc1.caption(f"📁 폴더에서 불러온 사진 {len(ss.folder_photos)}장")
-        if fc2.button("폴더 사진 비우기"):
-            ss.folder_photos = {}  # folder_last_id는 유지: 부품이 기억하는 이전 선택이 다시 들어오지 않게
-            bump()
-            st.rerun()
 
     if up_excel is not None:
         raw = up_excel.getvalue()
@@ -566,14 +421,14 @@ def main():
     slots: List[dict] = ss.slots
 
     # 업로드한 사진이 바뀌면, 연결 안 된 칸만 자동 연결 (기존 연결은 유지)
-    photo_map: Dict[str, bytes] = {**ss.folder_photos, **upload_map}
-    sig = tuple(photo_map.keys())
+    sig = tuple(upload_map.keys())
     if sig != ss.upload_sig:
         ss.upload_sig = sig
-        if slots and photo_map:
-            ss.assignments = auto_fill(slots, sorted(photo_map, key=natural_key), ss.assignments)
+        if slots and upload_map:
+            ss.assignments = auto_fill(slots, list(upload_map), ss.assignments)
         bump()
 
+    photo_map: Dict[str, bytes] = dict(upload_map)
     photo_names = sorted(photo_map, key=natural_key)
     ss.assignments = {k: v for k, v in ss.assignments.items() if v in photo_map and k < len(slots)}
     ss.deletes = {k for k in ss.deletes if k < len(slots)}
@@ -612,56 +467,62 @@ def main():
         blank = sum(1 for i, s in enumerate(slots) if i not in ss.assignments and not s["existing"])
         st.markdown(f"**요약:** 칸 {len(slots)}개 · 연결 {linked}개 · 비어 있는 칸 {blank}개 · 사진 {len(photo_names)}장")
 
-    ss.pick_target = max(0, min(ss.pick_target, len(slots) - 1))
-    ui_css(ss.pick_target)
-
     left, right = st.columns([1.3, 1.0], gap="large")
 
     with left:
         st.subheader("① 엑셀 사진 위치")
-        st.caption("사진을 넣을 **칸을 누르면** 빨간 굵은 테두리로 표시됩니다.")
+        options = [NONE] + photo_names
         for i, s in enumerate(slots):
-            linked_name = ss.assignments.get(i)
-            with slot_box(i):
-                st.button("선택", key=f"selslot_{i}", on_click=select_slot, args=(i,))  # 화면에는 안 보이는 투명 버튼
-                a, b = st.columns([1.4, 1.0])
+            cur = ss.assignments.get(i, NONE)
+            with st.container(border=True):
+                a, b = st.columns([2.2, 1.0])
                 with a:
                     st.markdown(f"**{slot_title(i, s)}**")
-                    if linked_name:
-                        st.caption(f"연결: {linked_name}")
-                    elif s["existing"] and i in ss.deletes:
-                        st.caption("기존 사진 삭제 예정")
-                    elif s["existing"]:
-                        st.caption("기존 사진 있음")
+                    sel = st.selectbox(
+                        f"칸 {i + 1}", options, index=options.index(cur) if cur in options else 0,
+                        key=f"sel_{i}_{ss.ver}", label_visibility="collapsed",
+                    )
+                    if sel == NONE:
+                        ss.assignments.pop(i, None)
                     else:
-                        st.caption("비어 있음")
-                    if linked_name:
-                        st.button("연결 해제", key=f"unlink_{i}_{ss.ver}", on_click=unassign, args=(i,))
-                    elif s["existing"]:
-                        want_del = st.checkbox("기존 사진 삭제", value=i in ss.deletes, key=f"del_{i}_{ss.ver}")
+                        ss.assignments[i] = sel
+                        ss.deletes.discard(i)
+                    if s["existing"] and sel == NONE:
+                        want_del = st.checkbox(
+                            "기존 사진 삭제", value=i in ss.deletes, key=f"del_{i}_{ss.ver}",
+                        )
                         (ss.deletes.add if want_del else ss.deletes.discard)(i)
                 with b:
-                    if linked_name and linked_name in photo_map:
-                        t = get_thumb(linked_name, photo_map[linked_name])
+                    shown = ss.assignments.get(i)
+                    if shown and shown in photo_map:
+                        t = get_thumb(shown, photo_map[shown])
                         if t:
                             st.image(t, caption="연결됨")
                     elif s["old_thumb"]:
-                        st.image(s["old_thumb"], caption="삭제 예정" if i in ss.deletes else "기존 사진")
+                        st.image(s["old_thumb"], caption="삭제 예약" if i in ss.deletes else "기존 사진")
                     else:
                         st.caption("미리보기 없음")
+        dup = [n for n in set(ss.assignments.values()) if list(ss.assignments.values()).count(n) > 1]
+        if dup:
+            st.warning("같은 사진이 여러 칸에 연결되어 있습니다: " + ", ".join(dup))
 
     with right:
         st.subheader(f"② 사진 목록 ({len(photo_names)}장)")
         if not photo_names:
             st.info("사진을 올리면 여기에 미리보기가 표시됩니다.")
         else:
-            st.checkbox("넣은 뒤 다음 빈 칸으로 이동", value=True, key="auto_next")
+            ss.pick_target = min(ss.pick_target, len(slots) - 1)
+            tgt = st.selectbox(
+                "지금 연결할 칸 (아래 사진의 '선택' 버튼을 누르면 이 칸에 들어갑니다)",
+                options=list(range(len(slots))), index=ss.pick_target,
+                format_func=lambda i: slot_title(i, slots[i]), key=f"pick_{ss.ver}",
+            )
+            ss.pick_target = tgt
             used_by = {v: k + 1 for k, v in ss.assignments.items()}
             cols = st.columns(2)
             for idx, n in enumerate(photo_names):
                 with cols[idx % 2]:
-                    with photo_box(idx):
-                        st.button("선택", key=f"pickbtn_{idx}", on_click=pick_photo, args=(n,))  # 투명 버튼
+                    with st.container(border=True):
                         t = get_thumb(n, photo_map[n])
                         if t:
                             st.image(t)
@@ -670,6 +531,13 @@ def main():
                         st.caption(n)
                         if n in used_by:
                             st.success(f"✓ {used_by[n]}번 칸에 연결됨")
+                        if st.button("이 사진 선택", key=f"pickbtn_{idx}_{ss.ver}"):
+                            assign(tgt, n)
+                            order = list(range(tgt + 1, len(slots))) + list(range(0, tgt))
+                            nxt = next((k for k in order if k not in ss.assignments and k not in ss.deletes), None)
+                            if nxt is not None:
+                                ss.pick_target = nxt
+                            st.rerun()
 
     st.divider()
     b1, b2 = st.columns(2)
