@@ -4,16 +4,14 @@
 
 원본(Windows + Excel + tkinter)의 '사진 연결' 화면을 웹으로 옮긴 버전입니다.
 - 엑셀의 {{이미지}} / {{이미지:파일명}} 표식 칸과 기존 사진 자리를 찾아 사진을 연결·삽입
-- 사진 촬영(카메라) → 선택한 칸에 바로 연결, 다음 빈 칸으로 자동 이동
+- 사진 미리보기에서 '이 사진 선택' 버튼으로 칸에 연결, 다음 빈 칸으로 자동 이동
 - A1 회사 로고 보호, 인쇄 영역 밖 칸 제외, 기존 사진 교체/삭제 예약, EXIF 회전 보정
-필요 라이브러리: streamlit, openpyxl, pillow, streamlit-back-camera-input(후면 카메라)
+필요 라이브러리: streamlit, openpyxl, pillow, pillow-heif(아이패드 HEIC 사진)
 """
 from __future__ import annotations
 
-import datetime
 import io
 import re
-import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -30,19 +28,18 @@ from openpyxl.utils import column_index_from_string, get_column_letter, range_bo
 from openpyxl.utils.units import pixels_to_EMU
 from PIL import Image, ImageOps
 
-try:  # 후면 카메라용 부품 (없으면 기본 카메라로 자동 대체)
-    from streamlit_back_camera_input import back_camera_input
-    HAS_BACK_CAM = True
+try:  # 아이패드 사진(HEIC) 읽기 지원 (없어도 JPG/PNG는 정상 동작)
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
 except Exception:
-    HAS_BACK_CAM = False
+    pass
 
 # ─────────────────────────────── 상수 ───────────────────────────────
 VERSION = "3.0-web"
 SLOT_MARKUP = re.compile(r"\{\{\s*이미지\s*(?::\s*([^}]*?))?\s*\}\}")
-IMG_EXT = ("jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff")
+IMG_EXT = ("jpg", "jpeg", "png", "heic", "heif", "webp", "bmp", "gif", "tif", "tiff")
 IMAGE_MARGIN_PX = 4      # 셀 안쪽 여백(px)
-THUMB = 240              # 화면용 미리보기 최대 크기(px)
-CAM_MAX_SIDE = 2400      # 촬영본 긴 변 최대(px) - 메모리 절약
+THUMB = 320              # 화면용 미리보기 최대 크기(px)
 STORE_SCALE = 2          # 엑셀에 넣는 사진 해상도 배수(인쇄 품질)
 NONE = "(선택 안 함)"
 
@@ -76,16 +73,6 @@ def make_thumb(data: bytes, size: int = THUMB) -> Optional[bytes]:
         return buf.getvalue()
     except Exception:
         return None
-
-
-def normalize_photo(data: bytes, max_side: int = CAM_MAX_SIDE) -> bytes:
-    """촬영본을 회전 보정 후 적당한 크기의 JPEG로 정리합니다."""
-    im = Image.open(io.BytesIO(data))
-    im = ImageOps.exif_transpose(im).convert("RGB")
-    im.thumbnail((max_side, max_side))
-    buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=92)
-    return buf.getvalue()
 
 
 # ─────────────────────── 셀 크기 계산 (엑셀 → 픽셀) ───────────────────────
@@ -352,46 +339,13 @@ def auto_fill(slots: List[dict], photo_names: List[str], current: Dict[int, str]
     return assign
 
 
-def suggest_photo_name(slots: List[dict], idx: int, taken: set) -> str:
-    """선택한 칸의 표식({{이미지:...}})을 바탕으로 저장 파일명을 제안 (중복이면 _1, _2 …)."""
-    if idx is None or idx >= len(slots):
-        return datetime.datetime.now().strftime("IMG_%Y%m%d_%H%M%S.jpg")
-    raw = (slots[idx].get("label") or "").strip() or f"칸_{idx + 1}"
-    safe = sanitize_filename(raw) or f"칸_{idx + 1}"
-    if safe.lower().endswith((".jpg", ".jpeg", ".png")):
-        stem, ext = safe.rsplit(".", 1)[0], "." + safe.rsplit(".", 1)[1]
-    else:
-        stem, ext = safe, ".jpg"
-    name = f"{stem}{ext}"
-    low = {t.casefold() for t in taken}
-    n = 1
-    while name.casefold() in low:
-        name = f"{stem}_{n}{ext}"
-        n += 1
-    return name
-
-
-def finalize_name(raw: str, taken: set) -> str:
-    """사용자가 입력한 파일명을 안전하게 정리하고 중복을 피합니다."""
-    name = sanitize_filename(raw) or datetime.datetime.now().strftime("IMG_%Y%m%d_%H%M%S")
-    if not name.lower().endswith((".jpg", ".jpeg", ".png")):
-        name += ".jpg"
-    stem, ext = name.rsplit(".", 1)[0], "." + name.rsplit(".", 1)[1]
-    low = {t.casefold() for t in taken}
-    out, n = name, 1
-    while out.casefold() in low:
-        out = f"{stem}_{n}{ext}"
-        n += 1
-    return out
-
-
 # ─────────────────────────────── 세션 상태 ───────────────────────────────
 def init_state():
     defaults = {
         "excel_bytes": None, "excel_name": "", "slots": [],
         "assignments": {}, "deletes": set(), "ver": 0,
-        "captured": {}, "cam_n": 0, "cam_target": 0,
-        "upload_sig": None, "result_bytes": None, "thumbs": {}, "flash": "",
+        "pick_target": 0,
+        "upload_sig": None, "result_bytes": None, "thumbs": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -426,89 +380,6 @@ def slot_title(i: int, s: dict) -> str:
     return f"#{i + 1}  [{s['sheet']}!{s['addr']}]  {tag}"
 
 
-# ─────────────────────────────── 카메라 ───────────────────────────────
-def camera_section(slots: List[dict], upload_names: List[str]):
-    ss = st.session_state
-    with st.container(border=True):
-        st.markdown("#### 📷 사진 촬영")
-        on = st.checkbox("카메라 켜기 (처음에는 Safari가 카메라 권한을 물어봅니다 → 허용)", key="cam_on")
-        if not on:
-            st.caption("촬영한 사진은 아래 사진 목록에 추가되고, 선택한 칸에 바로 연결할 수 있습니다.")
-            return
-
-        taken = set(upload_names) | set(ss.captured) | {v for v in ss.assignments.values()}
-        tgt = None
-        if slots:
-            ss.cam_target = min(ss.cam_target, len(slots) - 1)
-            tgt = st.selectbox(
-                "촬영한 사진을 연결할 칸",
-                options=list(range(len(slots))),
-                index=ss.cam_target,
-                format_func=lambda i: slot_title(i, slots[i]),
-                key=f"camtgt_{ss.ver}",
-            )
-            ss.cam_target = tgt
-        auto = st.checkbox("촬영 즉시 위 칸에 연결하고, 다음 빈 칸으로 이동", value=True, key="cam_auto")
-        name_in = st.text_input(
-            "저장 파일명",
-            value=suggest_photo_name(slots, tgt, taken),
-            key=f"camname_{ss.cam_n}_{tgt}_{ss.ver}",
-        )
-        OPT_NATIVE = "기기 카메라 앱 (후면·고화질, 아이패드 권장)"
-        OPT_REAR = "앱 내 후면 카메라 (영상을 터치하면 촬영)"
-        OPT_DEFAULT = "기본 카메라 (기기에 따라 전·후면 전환 버튼)"
-        opts = [OPT_NATIVE] + ([OPT_REAR] if HAS_BACK_CAM else []) + [OPT_DEFAULT]
-        try:  # 안드로이드는 기본 카메라에 전환 버튼이 생기므로 그쪽을 먼저 선택
-            ua = str(st.context.headers.get("User-Agent", ""))
-        except Exception:
-            ua = ""
-        mode = st.radio(
-            "카메라 방식", opts, index=opts.index(OPT_DEFAULT) if "Android" in ua else 0,
-            horizontal=False, key="cam_side",
-        )
-        if mode == OPT_NATIVE:
-            st.caption("아래 칸을 누르고 **‘사진 찍기’**를 고르면 기기의 카메라 앱이 열립니다(후면). 찍은 뒤 **‘사진 사용’**을 누르면 저장됩니다.")
-            shot = st.file_uploader(
-                "카메라 앱으로 촬영", type=list(IMG_EXT), key=f"native_{ss.cam_n}", label_visibility="collapsed",
-            )
-        elif mode == OPT_REAR:
-            st.caption("카메라 화면(영상)을 **한 번 터치**하면 촬영됩니다.")
-            shot = back_camera_input(height=450, width=480, key=f"bcam_{ss.cam_n}")
-        else:
-            shot = st.camera_input("셔터를 누르면 저장됩니다", key=f"cam_{ss.cam_n}", label_visibility="collapsed")
-        if shot is not None:
-            try:
-                data = normalize_photo(shot.getvalue())
-            except Exception as e:
-                st.error(f"사진 처리 실패: {e}")
-                return
-            name = finalize_name(name_in, taken)
-            ss.captured[name] = data
-            msg = f"✓ 촬영 저장: {name}"
-            if auto and tgt is not None:
-                assign(tgt, name)
-                order = list(range(tgt + 1, len(slots))) + list(range(0, tgt))
-                nxt = next((k for k in order if k not in ss.assignments and k not in ss.deletes), None)
-                if nxt is not None:
-                    ss.cam_target = nxt
-                msg += f" → {tgt + 1}번 칸에 연결"
-            ss.flash = msg
-            ss.cam_n += 1
-            st.rerun()
-
-        if ss.captured:
-            st.caption(f"이번 접속에서 촬영한 사진 {len(ss.captured)}장 (새로고침하면 사라지니, 아래 버튼으로 보관하세요)")
-            zbuf = io.BytesIO()
-            with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_STORED) as zf:
-                for n, d in ss.captured.items():
-                    zf.writestr(n, d)
-            st.download_button(
-                "💾 촬영 사진 모두 내려받기 (.zip)", zbuf.getvalue(),
-                file_name=datetime.datetime.now().strftime("촬영사진_%Y%m%d_%H%M.zip"),
-                mime="application/zip",
-            )
-
-
 # ─────────────────────────────── 메인 화면 ───────────────────────────────
 def main():
     init_state()
@@ -516,9 +387,6 @@ def main():
 
     st.title("🖼 엑셀 사진 원스톱")
     st.caption(f"v{VERSION} · 엑셀의 사진 위치를 찾아 사진을 연결하고 한 번에 삽입·저장합니다. (아이패드 Safari 지원)")
-    if ss.flash:
-        st.success(ss.flash)
-        ss.flash = ""
 
     up1, up2 = st.columns(2)
     with up1:
@@ -529,7 +397,7 @@ def main():
     with up2:
         up_photos = st.file_uploader(
             "② 점검 사진 (여러 장 선택 가능)", type=list(IMG_EXT), accept_multiple_files=True,
-            help="아이패드: 선택 창에서 '사진 보관함' 또는 '사진 찍기'를 고를 수 있습니다.",
+            help="아이패드 사진(HEIC)도 올릴 수 있습니다. 올린 사진은 아래 '② 사진 목록'에서 미리 보고 선택합니다.",
         )
 
     upload_map: Dict[str, bytes] = {}
@@ -541,7 +409,7 @@ def main():
         if raw != ss.excel_bytes:
             ss.excel_bytes, ss.excel_name = raw, up_excel.name
             ss.assignments, ss.deletes = {}, set()
-            ss.result_bytes, ss.cam_target, ss.upload_sig = None, 0, None
+            ss.result_bytes, ss.pick_target, ss.upload_sig = None, 0, None
             bump()
             try:
                 with st.spinner("엑셀에서 사진 위치를 찾는 중..."):
@@ -560,10 +428,7 @@ def main():
             ss.assignments = auto_fill(slots, list(upload_map), ss.assignments)
         bump()
 
-    # 카메라 (엑셀을 올린 뒤에 칸 선택 가능)
-    camera_section(slots, list(upload_map))
-
-    photo_map: Dict[str, bytes] = {**ss.captured, **upload_map}
+    photo_map: Dict[str, bytes] = dict(upload_map)
     photo_names = sorted(photo_map, key=natural_key)
     ss.assignments = {k: v for k, v in ss.assignments.items() if v in photo_map and k < len(slots)}
     ss.deletes = {k for k in ss.deletes if k < len(slots)}
@@ -573,7 +438,7 @@ def main():
         with st.expander("💡 사용 방법"):
             st.markdown(
                 "1. 사진이 들어갈 셀에 `{{이미지}}` 또는 `{{이미지:101.jpg}}`를 적은 엑셀을 올립니다. (A1 로고는 자동 보호)\n"
-                "2. 사진을 여러 장 올리거나, **📷 사진 촬영**으로 현장에서 바로 찍습니다.\n"
+                "2. 점검 사진을 여러 장 올립니다. 올린 사진은 미리보기로 확인하며 고를 수 있습니다.\n"
                 "3. 파일명이 같은 사진은 자동 연결됩니다. 칸마다 선택 상자로 바꿀 수 있습니다.\n"
                 "4. **사진 삽입** 후 **결과 파일 다운로드**를 누릅니다."
             )
@@ -644,19 +509,35 @@ def main():
     with right:
         st.subheader(f"② 사진 목록 ({len(photo_names)}장)")
         if not photo_names:
-            st.info("사진을 올리거나 촬영하면 여기에 표시됩니다.")
+            st.info("사진을 올리면 여기에 미리보기가 표시됩니다.")
         else:
+            ss.pick_target = min(ss.pick_target, len(slots) - 1)
+            tgt = st.selectbox(
+                "지금 연결할 칸 (아래 사진의 '선택' 버튼을 누르면 이 칸에 들어갑니다)",
+                options=list(range(len(slots))), index=ss.pick_target,
+                format_func=lambda i: slot_title(i, slots[i]), key=f"pick_{ss.ver}",
+            )
+            ss.pick_target = tgt
             used_by = {v: k + 1 for k, v in ss.assignments.items()}
-            cols = st.columns(3)
+            cols = st.columns(2)
             for idx, n in enumerate(photo_names):
-                with cols[idx % 3]:
+                with cols[idx % 2]:
                     with st.container(border=True):
                         t = get_thumb(n, photo_map[n])
                         if t:
                             st.image(t)
+                        else:
+                            st.warning("미리보기를 만들 수 없는 사진입니다 (형식 확인)")
+                        st.caption(n)
                         if n in used_by:
-                            st.success(f"✓ {used_by[n]}번 칸")
-                        st.caption(("📷 " if n in ss.captured else "") + n)
+                            st.success(f"✓ {used_by[n]}번 칸에 연결됨")
+                        if st.button("이 사진 선택", key=f"pickbtn_{idx}_{ss.ver}"):
+                            assign(tgt, n)
+                            order = list(range(tgt + 1, len(slots))) + list(range(0, tgt))
+                            nxt = next((k for k in order if k not in ss.assignments and k not in ss.deletes), None)
+                            if nxt is not None:
+                                ss.pick_target = nxt
+                            st.rerun()
 
     st.divider()
     b1, b2 = st.columns(2)
