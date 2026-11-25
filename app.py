@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import base64
 import io
 import re
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import (
     AnchorMarker,
@@ -33,6 +35,16 @@ try:  # 아이패드 사진(HEIC) 읽기 지원 (없어도 JPG/PNG는 정상 동
     register_heif_opener()
 except Exception:
     pass
+
+# 폴더 선택 부품 (app.py와 같은 위치의 folder_picker 폴더가 필요)
+try:
+    _folder_picker = components.declare_component(
+        "folder_picker", path=str(Path(__file__).parent / "folder_picker")
+    )
+    HAS_FOLDER_PICKER = True
+except Exception:
+    _folder_picker = None
+    HAS_FOLDER_PICKER = False
 
 # ─────────────────────────────── 상수 ───────────────────────────────
 VERSION = "3.0-web"
@@ -344,7 +356,7 @@ def init_state():
     defaults = {
         "excel_bytes": None, "excel_name": "", "slots": [],
         "assignments": {}, "deletes": set(), "ver": 0,
-        "pick_target": 0,
+        "pick_target": 0, "folder_photos": {}, "folder_last_id": None,
         "upload_sig": None, "result_bytes": None, "thumbs": {},
     }
     for k, v in defaults.items():
@@ -438,6 +450,41 @@ def ui_css(active: int):
     )
 
 
+def unique_name(name: str, taken: set) -> str:
+    low = {t.casefold() for t in taken}
+    if name.casefold() not in low:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    n = 1
+    while True:
+        cand = f"{stem}_{n}" + (f".{ext}" if ext else "")
+        if cand.casefold() not in low:
+            return cand
+        n += 1
+
+
+def ingest_folder_value(val, upload_names) -> Tuple[int, List[str]]:
+    """폴더 선택 부품이 보내 온 사진을 세션에 추가합니다. (같은 선택은 한 번만 처리)"""
+    ss = st.session_state
+    if not isinstance(val, dict) or not val.get("id") or val["id"] == ss.folder_last_id:
+        return 0, []
+    ss.folder_last_id = val["id"]
+    added = 0
+    failed = list(val.get("failed") or [])
+    for f in val.get("files") or []:
+        try:
+            raw = base64.b64decode(str(f["data"]).split(",", 1)[1])
+        except Exception:
+            failed.append(str(f.get("name", "?")))
+            continue
+        name = unique_name(str(f["name"]), set(ss.folder_photos) | set(upload_names))
+        ss.folder_photos[name] = raw
+        added += 1
+    return added, failed
+
+
 def get_thumb(name: str, data: bytes) -> Optional[bytes]:
     key = (name, len(data))
     cache = st.session_state.thumbs
@@ -459,21 +506,48 @@ def main():
     st.title("🖼 엑셀 사진 원스톱")
     st.caption(f"v{VERSION} · 엑셀의 사진 위치를 찾아 사진을 연결하고 한 번에 삽입·저장합니다. (아이패드 Safari 지원)")
 
-    up1, up2 = st.columns(2)
+    up1, up2 = st.columns([1, 1.5])
     with up1:
         up_excel = st.file_uploader(
             "① 대상 엑셀 (.xlsx)", type=["xlsx", "xlsm"],
             help="사진 넣을 칸에 {{이미지}} 또는 {{이미지:파일명.jpg}}가 적힌 엑셀",
         )
-    with up2:
-        up_photos = st.file_uploader(
+
+    def photo_uploader():
+        return st.file_uploader(
             "② 점검 사진 (여러 장 선택 가능)", type=list(IMG_EXT), accept_multiple_files=True,
             help="아이패드 사진(HEIC)도 올릴 수 있습니다. 올린 사진은 아래 '② 사진 목록'에서 미리 보고 선택합니다.",
         )
 
+    folder_val = None
+    with up2:
+        if HAS_FOLDER_PICKER:
+            c_up, c_fold = st.columns([3, 1])      # Upload 버튼 오른쪽에 '폴더 선택'
+            with c_up:
+                up_photos = photo_uploader()
+            with c_fold:
+                folder_val = _folder_picker(key="folder_picker", default=None)
+            st.caption("📁 폴더 선택: 폴더 안의 사진을 한 번에 불러옵니다(긴 변 1600px로 축소). 기기에 따라 폴더 대신 사진 여러 장 선택 창이 열릴 수 있습니다.")
+        else:
+            up_photos = photo_uploader()
+            st.caption("⚠ folder_picker 폴더가 없어 '폴더 선택'을 쓸 수 없습니다. GitHub에 folder_picker 폴더도 올려 주세요.")
+
     upload_map: Dict[str, bytes] = {}
     for f in sorted(up_photos or [], key=lambda f: natural_key(f.name)):
         upload_map[f.name] = f.getvalue()
+
+    added, failed = ingest_folder_value(folder_val, list(upload_map))
+    if added:
+        st.success(f"폴더에서 사진 {added}장을 불러왔습니다.")
+    if failed:
+        st.warning("불러오지 못한 사진: " + ", ".join(failed))
+    if ss.folder_photos:
+        fc1, fc2 = st.columns([3, 1])
+        fc1.caption(f"📁 폴더에서 불러온 사진 {len(ss.folder_photos)}장")
+        if fc2.button("폴더 사진 비우기"):
+            ss.folder_photos = {}  # folder_last_id는 유지: 부품이 기억하는 이전 선택이 다시 들어오지 않게
+            bump()
+            st.rerun()
 
     if up_excel is not None:
         raw = up_excel.getvalue()
@@ -492,14 +566,14 @@ def main():
     slots: List[dict] = ss.slots
 
     # 업로드한 사진이 바뀌면, 연결 안 된 칸만 자동 연결 (기존 연결은 유지)
-    sig = tuple(upload_map.keys())
+    photo_map: Dict[str, bytes] = {**ss.folder_photos, **upload_map}
+    sig = tuple(photo_map.keys())
     if sig != ss.upload_sig:
         ss.upload_sig = sig
-        if slots and upload_map:
-            ss.assignments = auto_fill(slots, list(upload_map), ss.assignments)
+        if slots and photo_map:
+            ss.assignments = auto_fill(slots, sorted(photo_map, key=natural_key), ss.assignments)
         bump()
 
-    photo_map: Dict[str, bytes] = dict(upload_map)
     photo_names = sorted(photo_map, key=natural_key)
     ss.assignments = {k: v for k, v in ss.assignments.items() if v in photo_map and k < len(slots)}
     ss.deletes = {k for k in ss.deletes if k < len(slots)}
