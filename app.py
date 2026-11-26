@@ -38,6 +38,7 @@ except Exception:
 VERSION = "3.1-web"
 SLOT_MARKUP = re.compile(r"\{\{\s*이미지\s*(?::\s*([^}]*?))?\s*\}\}")
 IMG_EXT = ("jpg", "jpeg", "png", "heic", "heif", "webp", "bmp", "gif", "tif", "tiff")
+FILE_LIKE = re.compile(r"\.(jpe?g|png|heic|heif|webp|bmp|gif|tiff?)\s*$", re.I)  # 라벨이 파일명 형태인지
 IMAGE_MARGIN_PX = 4      # 셀 안쪽 여백(px)
 THUMB = 320              # 현재 칸 미리보기 최대 크기(px)
 GRID_THUMB = 220         # 사진 격자 미리보기 크기(px) - 작게 해서 화면을 가볍게
@@ -309,7 +310,7 @@ def insert_photos(
 
 # ─────────────────────────── 자동 연결·이름 제안 ───────────────────────────
 def auto_fill(slots: List[dict], photo_names: List[str], current: Dict[int, str], sequential: bool = True) -> Dict[int, str]:
-    """이미 연결된 칸은 유지. 1) {{이미지:파일명}} 이름 일치 → 2) 이름 없는 빈 칸은 남은 사진을 순서대로."""
+    """이미 연결된 칸은 유지. 1) {{이미지:파일명}} 이름 일치 → 2) 제목만 적었거나 비어 있는 칸은 남은 사진을 순서대로."""
     assign = {k: v for k, v in current.items() if v in photo_names}
     by_name: Dict[str, str] = {}
     for n in photo_names:
@@ -334,8 +335,9 @@ def auto_fill(slots: List[dict], photo_names: List[str], current: Dict[int, str]
         return assign
     free = iter([n for n in photo_names if n not in used])
     for i, s in enumerate(slots):
-        if i in assign or (s.get("label") or "").strip():
-            continue
+        label = (s.get("label") or "").strip()
+        if i in assign or (label and FILE_LIKE.search(label)):
+            continue            # 파일명을 지정한 칸(예: {{이미지:101.jpg}})은 그 사진만 기다림
         nxt = next(free, None)
         if nxt is None:
             break
@@ -521,8 +523,9 @@ def main():
 
     # ── 지금 칸
     with st.container(border=True):
-        st.markdown(f"### 지금 칸 {cur + 1} / {n_slots}")
-        st.caption(f"[{cs['sheet']}!{cs['addr']}]  {cs['label'] or ('기존 사진 자리' if cs['kind'] == 'pic' else '빈 칸')}")
+        title = cs["label"] or ("기존 사진 자리" if cs["kind"] == "pic" else f"{cur + 1}번 칸")
+        st.markdown(f"### {title}")
+        st.caption(f"칸 {cur + 1} / {n_slots}  ·  [{cs['sheet']}!{cs['addr']}]")
         pa, pb = st.columns([1, 1.4])
         with pa:
             if linked_name and linked_name in photo_map:
