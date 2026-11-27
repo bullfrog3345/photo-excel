@@ -5,13 +5,16 @@
 원본(Windows + Excel + tkinter)의 '사진 연결' 화면을 웹으로 옮긴 버전입니다.
 - 엑셀의 {{이미지}} / {{이미지:파일명}} 표식 칸과 기존 사진 자리를 찾아 사진을 연결·삽입
 - 칸 순서대로 진행: 지금 칸을 크게 보여 주고, 사진을 고르면 다음 칸으로 자동 이동 (사진이 칸보다 많을 때 편함)
+- 시트가 여러 장인 엑셀: 시트 선택 → 그 시트 사진 업로드 → 삽입 → 저장 → 다음 시트 (사진은 시트마다 비움)
 - A1 회사 로고 보호, 인쇄 영역 밖 칸 제외, 기존 사진 교체/삭제 예약, EXIF 회전 보정
 필요 라이브러리: streamlit, openpyxl, pillow, pillow-heif(아이패드 HEIC 사진)
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -35,7 +38,7 @@ except Exception:
     pass
 
 # ─────────────────────────────── 상수 ───────────────────────────────
-VERSION = "3.1-web"
+VERSION = "3.2-web"
 SLOT_MARKUP = re.compile(r"\{\{\s*이미지\s*(?::\s*([^}]*?))?\s*\}\}")
 IMG_EXT = ("jpg", "jpeg", "png", "heic", "heif", "webp", "bmp", "gif", "tif", "tiff")
 FILE_LIKE = re.compile(r"\.(jpe?g|png|heic|heif|webp|bmp|gif|tiff?)\s*$", re.I)  # 라벨이 파일명 형태인지
@@ -349,6 +352,8 @@ def auto_fill(slots: List[dict], photo_names: List[str], current: Dict[int, str]
 def init_state():
     defaults = {
         "excel_bytes": None, "excel_name": "", "slots": [],
+        "all_slots": [], "sheet_names": [], "done": {}, "cur_sheet": None,
+        "excel_hash": None, "up_n": 0, "ins_msg": "", "ins_logs": [], "notice": "",
         "assignments": {}, "deletes": set(), "ver": 0,
         "pick_target": 0, "show_n": PAGE,
         "upload_sig": None, "result_bytes": None, "thumbs": {},
@@ -400,6 +405,43 @@ def pick_photo(name: str):
             ss.pick_target = nxt
 
 
+def nav_box(i: int):
+    try:
+        return st.container(border=True, key=f"navbox_{i}")
+    except TypeError:
+        return st.container(border=True)
+
+
+def nav_css(cur: int, done, pending, deleting):
+    """칸 이동 줄의 색 테두리: 초록=삽입됨/기존 사진, 주황=연결됨(삽입 전), 회색 점선=삭제 예정, 빨강=지금 칸."""
+    rules = [
+        '.st-key-navrow [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 0.4rem; }',
+        '.st-key-navrow [data-testid="stColumn"], .st-key-navrow [data-testid="column"] '
+        '{ min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }',
+    ]
+    for i in done:
+        rules.append(f".st-key-navbox_{i} {{ border: 3px solid #21c354 !important; background: rgba(33,195,84,0.08); }}")
+    for i in pending:
+        rules.append(f".st-key-navbox_{i} {{ border: 3px solid #ffa421 !important; background: rgba(255,164,33,0.10); }}")
+    for i in deleting:
+        rules.append(f".st-key-navbox_{i} {{ border: 3px dashed #9a9a9a !important; }}")
+    rules.append(f".st-key-navbox_{cur} {{ border: 4px solid #ff4b4b !important; }}")
+    st.markdown("<style>" + " ".join(rules) + "</style>", unsafe_allow_html=True)
+
+
+def next_sheet():
+    """삽입을 마친 뒤 다음 시트로 이동합니다. (사진 업로드 칸은 시트가 바뀔 때 자동으로 비워짐)"""
+    ss = st.session_state
+    if ss.assignments or ss.deletes:
+        ss.notice = "이 시트에 삽입하지 않은 연결이 있습니다. 먼저 '이 시트에 사진 삽입'을 누르거나 '연결 초기화'를 하세요."
+        return
+    names = ss.sheet_names
+    if ss.get("sheet_sel") in names:
+        i = names.index(ss.sheet_sel)
+        if i + 1 < len(names):
+            ss.sheet_sel = names[i + 1]
+
+
 def get_thumb(name: str, data: bytes, size: int = THUMB) -> Optional[bytes]:
     key = (name, len(data), size)
     cache = st.session_state.thumbs
@@ -421,40 +463,95 @@ def main():
     st.title("🖼 엑셀 사진 원스톱")
     st.caption(f"v{VERSION} · 엑셀의 사진 위치를 찾아 사진을 연결하고 한 번에 삽입·저장합니다. (아이패드 Safari 지원)")
 
+    if ss.ins_msg:
+        st.success(ss.ins_msg)
+        if ss.ins_logs:
+            with st.expander("상세 처리 로그"):
+                for line in ss.ins_logs:
+                    st.text(line)
+
     up1, up2 = st.columns(2)
+    sel = None
     with up1:
         up_excel = st.file_uploader(
             "① 대상 엑셀 (.xlsx)", type=["xlsx", "xlsm"],
-            help="사진 넣을 칸에 {{이미지}} 또는 {{이미지:파일명.jpg}}가 적힌 엑셀",
+            help="사진 넣을 칸에 {{이미지}} 또는 {{이미지:제목}} / {{이미지:파일명.jpg}}가 적힌 엑셀",
         )
+        if up_excel is not None:
+            raw = up_excel.getvalue()
+            h = hashlib.md5(raw).hexdigest()
+            if h != ss.excel_hash:            # 새 엑셀을 올렸을 때만 처음부터 다시 시작
+                ss.excel_hash = h
+                ss.excel_bytes, ss.excel_name = raw, up_excel.name
+                ss.assignments, ss.deletes = {}, set()
+                ss.pick_target, ss.upload_sig, ss.show_n = 0, None, PAGE
+                ss.done, ss.cur_sheet, ss.ins_msg, ss.ins_logs, ss.thumbs = {}, None, "", [], {}
+                ss.pop("sheet_sel", None)
+                bump()
+                try:
+                    with st.spinner("엑셀에서 사진 위치를 찾는 중..."):
+                        ss.all_slots = scan_excel_slots(raw)
+                except Exception as e:
+                    ss.all_slots = []
+                    st.error(f"엑셀을 읽지 못했습니다: {e}")
+                ss.sheet_names = list(dict.fromkeys(sl["sheet"] for sl in ss.all_slots))
+        if ss.sheet_names:
+            counts = Counter(sl["sheet"] for sl in ss.all_slots)
+            sel = st.selectbox(
+                f"② 점검 시트 선택 (사진 칸이 있는 시트 {len(ss.sheet_names)}개)",
+                ss.sheet_names, key="sheet_sel",
+                format_func=lambda nm: f"{'🟢' if nm in ss.done else '⚪'} {nm}  ({counts[nm]}칸)",
+            )
     with up2:
         up_photos = st.file_uploader(
-            "② 점검 사진 (여러 장 선택 가능)", type=list(IMG_EXT), accept_multiple_files=True,
-            help="아이패드 사진(HEIC)도 올릴 수 있습니다. 올린 사진은 아래 '② 사진 목록'에서 미리 보고 선택합니다.",
+            "③ 이 시트의 점검 사진 (여러 장 선택 가능)", type=list(IMG_EXT), accept_multiple_files=True,
+            key=f"photos_{ss.up_n}",
+            help="아이패드 사진(HEIC)도 올릴 수 있습니다. 시트를 바꾸면 업로드한 사진은 자동으로 비워집니다.",
         )
 
     upload_map: Dict[str, bytes] = {}
     for f in sorted(up_photos or [], key=lambda f: natural_key(f.name)):
         upload_map[f.name] = f.getvalue()
 
-    if up_excel is not None:
-        raw = up_excel.getvalue()
-        if raw != ss.excel_bytes:
-            ss.excel_bytes, ss.excel_name = raw, up_excel.name
-            ss.assignments, ss.deletes = {}, set()
-            ss.result_bytes, ss.pick_target, ss.upload_sig, ss.show_n = None, 0, None, PAGE
-            bump()
-            try:
-                with st.spinner("엑셀에서 사진 위치를 찾는 중..."):
-                    ss.slots = scan_excel_slots(raw)
-            except Exception as e:
-                ss.slots = []
-                st.error(f"엑셀을 읽지 못했습니다: {e}")
+    if ss.excel_bytes is None:
+        st.info("👆 대상 엑셀을 올리고, 점검 시트를 고른 뒤, 그 시트의 사진을 올려 주세요.")
+        with st.expander("💡 사용 방법"):
+            st.markdown(
+                "1. 사진이 들어갈 셀에 `{{이미지}}`, `{{이미지:제목}}` 또는 `{{이미지:101.jpg}}`를 적은 엑셀을 올립니다. (A1 로고는 자동 보호)\n"
+                "2. **점검 시트**를 고르고, 그 시트(설비)의 사진을 올립니다.\n"
+                "3. 화면 위에 지금 칸이 크게 나옵니다. 아래에서 사진을 고르면 그 칸에 들어가고 다음 칸으로 넘어갑니다.\n"
+                "4. **이 시트에 사진 삽입** → **다음 시트로** → 사진 올리기 → 삽입 … 를 반복합니다. 칸을 다 못 채워도 삽입할 수 있습니다.\n"
+                "5. 중간중간 **결과 저장**으로 내려받아 두세요. 내려받은 파일에는 지금까지 삽입한 모든 시트가 들어 있습니다."
+            )
+        return
 
-    slots: List[dict] = ss.slots
+    if not ss.sheet_names or sel is None:
+        st.warning("이 엑셀에서 {{이미지}} 표식이나 기존 사진을 찾지 못했습니다. (인쇄 영역 밖의 칸은 제외됩니다.)")
+        return
 
-    # 업로드한 사진이 바뀌면, 연결 안 된 칸만 자동 연결 (기존 연결은 유지)
-    sig = tuple(upload_map.keys())
+    # 시트를 바꾸면: 연결·사진 목록을 비우고 새 시트로 시작
+    if sel != ss.cur_sheet:
+        first_time = ss.cur_sheet is None
+        pending = len(ss.assignments) + len(ss.deletes)
+        if not first_time and pending:
+            ss.notice = f"'{ss.cur_sheet}' 시트에서 삽입하지 않은 연결 {pending}개가 사라졌습니다."
+        ss.assignments, ss.deletes = {}, set()
+        ss.pick_target, ss.show_n, ss.upload_sig, ss.thumbs = 0, PAGE, None, {}
+        ss.ins_msg, ss.ins_logs = "", []
+        ss.cur_sheet = sel
+        bump()
+        if not first_time:
+            ss.up_n += 1          # 이전 시트의 사진 업로드를 비워서 가볍게 유지
+            st.rerun()
+    if ss.notice:
+        st.warning(ss.notice)
+        ss.notice = ""
+
+    slots: List[dict] = [sl for sl in ss.all_slots if sl["sheet"] == sel]
+    ss.slots = slots
+
+    # 업로드한 사진이 바뀌면, 파일명을 지정한 칸만 자동 연결 (기존 연결은 유지)
+    sig = (sel, tuple(upload_map.keys()))
     if sig != ss.upload_sig:
         ss.upload_sig = sig
         if slots and upload_map:
@@ -466,39 +563,8 @@ def main():
     ss.assignments = {k: v for k, v in ss.assignments.items() if v in photo_map and k < len(slots)}
     ss.deletes = {k for k in ss.deletes if k < len(slots)}
 
-    if up_excel is None and ss.excel_bytes is None:
-        st.info("👆 대상 엑셀과 사진을 올려 주세요.")
-        with st.expander("💡 사용 방법"):
-            st.markdown(
-                "1. 사진이 들어갈 셀에 `{{이미지}}` 또는 `{{이미지:101.jpg}}`를 적은 엑셀을 올립니다. (A1 로고는 자동 보호)\n"
-                "2. 점검 사진을 여러 장 올립니다. 올린 사진은 미리보기로 확인하며 고를 수 있습니다.\n"
-                "3. 화면 위에 지금 칸이 크게 나옵니다. 아래에서 사진을 고르면 그 칸에 들어가고 다음 칸으로 넘어갑니다.\n"
-                "4. **사진 삽입** 후 **결과 파일 다운로드**를 누릅니다."
-            )
-        return
-
-    if not slots:
-        st.warning("이 엑셀에서 {{이미지}} 표식이나 기존 사진을 찾지 못했습니다. (인쇄 영역 밖의 칸은 제외됩니다.)")
-        return
-
     st.divider()
-    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.5, 3])
-    with c1:
-        if st.button("🪄 빈 칸 자동 채우기", disabled=not photo_names, help="비어 있는 칸에 남은 사진을 이름 순서대로 채웁니다"):
-            ss.assignments = auto_fill(slots, photo_names, ss.assignments)
-            bump()
-            st.rerun()
-    with c2:
-        if st.button("🗑 연결 초기화"):
-            ss.assignments, ss.deletes = {}, set()
-            bump()
-            st.rerun()
-    with c3:
-        fit = st.checkbox("사진 비율 유지", value=True)
-    with c4:
-        linked = len(ss.assignments)
-        blank = sum(1 for i, s in enumerate(slots) if i not in ss.assignments and not s["existing"])
-        st.markdown(f"**요약:** 칸 {len(slots)}개 · 연결 {linked}개 · 비어 있는 칸 {blank}개 · 사진 {len(photo_names)}장")
+    left, right = st.columns([1, 1], gap="medium")     # 왼쪽: 칸·버튼 / 오른쪽: 사진 (스크롤 창)
 
     n_slots = len(slots)
     ss.pick_target = max(0, min(ss.pick_target, n_slots - 1))
@@ -506,104 +572,167 @@ def main():
     cs = slots[cur]
     linked_name = ss.assignments.get(cur)
 
-    # ── 칸 이동줄: 번호를 누르면 그 칸으로 이동 (✓=사진 연결됨, 🗑=기존 사진 삭제 예정)
-    st.markdown("**칸 이동**")
-    per_row = 8
-    for r0 in range(0, n_slots, per_row):
-        cols = st.columns(per_row)
-        for k in range(per_row):
-            i = r0 + k
-            if i >= n_slots:
-                break
-            mark = "✓" if i in ss.assignments else ("🗑" if i in ss.deletes else "")
-            cols[k].button(
-                f"{i + 1}{mark}", key=f"nav_{i}", on_click=goto_slot, args=(i,),
-                type="primary" if i == cur else "secondary",
-            )
+    # ───────────── 왼쪽: 칸 이동 · 지금 칸 · 삽입/다음/저장 ─────────────
+    with left:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🪄 빈 칸 자동 채우기", disabled=not photo_names, help="비어 있는 칸에 남은 사진을 이름 순서대로 채웁니다"):
+                ss.assignments = auto_fill(slots, photo_names, ss.assignments)
+                bump()
+                st.rerun()
+        with c2:
+            if st.button("🗑 연결 초기화"):
+                ss.assignments, ss.deletes = {}, set()
+                bump()
+                st.rerun()
+        fit = st.checkbox("사진 비율 유지", value=True)
+        linked = len(ss.assignments)
+        blank = sum(1 for i2, s2 in enumerate(slots) if i2 not in ss.assignments and not s2["existing"])
+        st.markdown(
+            f"**{sel}** · 칸 {len(slots)}개 · 연결 {linked}개 · 비어 있는 칸 {blank}개 · 사진 {len(photo_names)}장"
+            f"  \n삽입 완료 시트 {len(ss.done)} / {len(ss.sheet_names)}"
+        )
 
-    # ── 지금 칸
-    with st.container(border=True):
-        title = cs["label"] or ("기존 사진 자리" if cs["kind"] == "pic" else f"{cur + 1}번 칸")
-        st.markdown(f"### {title}")
-        st.caption(f"칸 {cur + 1} / {n_slots}  ·  [{cs['sheet']}!{cs['addr']}]")
-        pa, pb = st.columns([1, 1.4])
-        with pa:
-            if linked_name and linked_name in photo_map:
-                t = get_thumb(linked_name, photo_map[linked_name])
-                if t:
-                    st.image(t, caption=f"연결됨: {linked_name}")
-            elif cs["old_thumb"]:
-                st.image(cs["old_thumb"], caption="삭제 예정" if cur in ss.deletes else "기존 사진")
-            else:
-                st.caption("아직 사진이 없습니다.")
-        with pb:
-            st.button("◀ 이전 칸", key="prev_slot", on_click=goto_slot, args=(cur - 1,), disabled=cur == 0)
-            st.button("건너뛰기 ▶", key="next_slot", on_click=goto_slot, args=(cur + 1,), disabled=cur >= n_slots - 1)
-            if linked_name:
-                st.button("연결 해제", key=f"unlink_{cur}_{ss.ver}", on_click=unassign, args=(cur,))
-            elif cs["existing"]:
-                want_del = st.checkbox("기존 사진 삭제", value=cur in ss.deletes, key=f"del_{cur}_{ss.ver}")
-                (ss.deletes.add if want_del else ss.deletes.discard)(cur)
+        # 칸 이동: 사진 미리보기 + 번호 버튼, 상태별 색 테두리
+        done_idx = [i2 for i2, s2 in enumerate(slots) if s2["existing"] and i2 not in ss.deletes and i2 not in ss.assignments]
+        nav_css(cur, done_idx, list(ss.assignments), list(ss.deletes))
+        st.markdown("**칸 이동**")
+        st.caption("🟩 초록=사진 있음 · 🟧 주황=연결됨(아직 삽입 전) · 🟥 빨강=지금 칸")
+        per_row = 4
+        with st.container(key="navrow"):
+            for r0 in range(0, n_slots, per_row):
+                cols = st.columns(per_row)
+                for k in range(per_row):
+                    i2 = r0 + k
+                    if i2 >= n_slots:
+                        break
+                    with cols[k]:
+                        with nav_box(i2):
+                            nm = ss.assignments.get(i2)
+                            if nm and nm in photo_map:
+                                t = get_thumb(nm, photo_map[nm], 120)
+                            else:
+                                t = slots[i2]["old_thumb"]
+                            if t:
+                                st.image(t, width=64)
+                            else:
+                                st.caption("빈 칸")
+                            mark = "🗑" if i2 in ss.deletes else ""
+                            st.button(
+                                f"{i2 + 1}{mark}", key=f"nav_{i2}", on_click=goto_slot, args=(i2,),
+                                type="primary" if i2 == cur else "secondary",
+                            )
 
-    if n_slots and all(i in ss.assignments or i in ss.deletes or slots[i]["existing"] for i in range(n_slots)) and ss.assignments:
-        st.success("모든 칸이 채워졌습니다. 아래 '사진 삽입 실행'을 누르세요.")
-
-    # ── 사진 고르기
-    used = set(ss.assignments.values())
-    hide_used = st.checkbox("사용한 사진 숨기기", value=True, key="hide_used")
-    st.checkbox("넣은 뒤 다음 빈 칸으로 이동", value=True, key="auto_next")
-    pool = [n for n in photo_names if not (hide_used and n in used)]
-    st.subheader(f"사진 고르기 — 남은 사진 {len(pool)}장 / 전체 {len(photo_names)}장")
-    if not photo_names:
-        st.info("위에서 점검 사진을 올리면 여기에 미리보기가 나타납니다.")
-    elif not pool:
-        st.info("남은 사진이 없습니다. '사용한 사진 숨기기'를 끄면 모든 사진이 보입니다.")
-    else:
-        shown = pool[: ss.show_n]
-        used_by = {v: k + 1 for k, v in ss.assignments.items()}
-        grid = st.columns(3)
-        for idx, n in enumerate(shown):
-            with grid[idx % 3]:
-                with st.container(border=True):
-                    t = get_thumb(n, photo_map[n], GRID_THUMB)
+        # 지금 칸
+        with st.container(border=True):
+            title = cs["label"] or ("기존 사진 자리" if cs["kind"] == "pic" else f"{cur + 1}번 칸")
+            st.markdown(f"### {title}")
+            st.caption(f"칸 {cur + 1} / {n_slots}  ·  [{cs['sheet']}!{cs['addr']}]")
+            pa, pb = st.columns([1, 1.2])
+            with pa:
+                if linked_name and linked_name in photo_map:
+                    t = get_thumb(linked_name, photo_map[linked_name])
                     if t:
-                        st.image(t)
-                    else:
-                        st.warning("미리보기를 만들 수 없는 사진입니다")
-                    st.caption(n)
-                    if n in used_by:
-                        st.success(f"✓ {used_by[n]}번 칸")
-                    st.button("선택", key=f"pickbtn_{idx}_{ss.ver}", on_click=pick_photo, args=(n,))
-        if len(pool) > len(shown):
-            st.button(f"사진 더 보기 ({len(pool) - len(shown)}장 남음)", on_click=more_photos)
+                        st.image(t, caption=f"연결됨: {linked_name}")
+                elif cs["old_thumb"]:
+                    st.image(cs["old_thumb"], caption="삭제 예정" if cur in ss.deletes else "기존 사진")
+                else:
+                    st.caption("아직 사진이 없습니다.")
+            with pb:
+                st.button("◀ 이전 칸", key="prev_slot", on_click=goto_slot, args=(cur - 1,), disabled=cur == 0)
+                st.button("건너뛰기 ▶", key="next_slot", on_click=goto_slot, args=(cur + 1,), disabled=cur >= n_slots - 1)
+                if linked_name:
+                    st.button("연결 해제", key=f"unlink_{cur}_{ss.ver}", on_click=unassign, args=(cur,))
+                elif cs["existing"]:
+                    want_del = st.checkbox("기존 사진 삭제", value=cur in ss.deletes, key=f"del_{cur}_{ss.ver}")
+                    (ss.deletes.add if want_del else ss.deletes.discard)(cur)
 
-    with st.expander("연결 현황 보기"):
-        for i, sl in enumerate(slots):
-            nm = ss.assignments.get(i)
-            state = f"✓ {nm}" if nm else ("🗑 기존 사진 삭제" if i in ss.deletes else ("기존 사진 유지" if sl["existing"] else "비어 있음"))
-            st.text(f"{i + 1:>2}. [{sl['sheet']}!{sl['addr']}] {state}")
+        if n_slots and all(i2 in ss.assignments or i2 in ss.deletes or slots[i2]["existing"] for i2 in range(n_slots)) and ss.assignments:
+            st.success("모든 칸이 채워졌습니다. 아래 '이 시트에 사진 삽입'을 누르세요.")
 
-    st.divider()
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("🚀 사진 삽입 실행", type="primary"):
+        # 삽입 · 다음 시트 · 저장 (사진 목록이 오른쪽 스크롤 창에 있어서, 스크롤 없이 바로 누를 수 있음)
+        st.caption("삽입은 지금 선택한 시트만 처리합니다. 칸을 다 못 채워도 삽입할 수 있습니다.")
+        if st.button("🚀 이 시트에 사진 삽입", type="primary"):
             if not ss.assignments and not ss.deletes:
                 st.error("연결된 사진이나 삭제 예약이 최소 1개 필요합니다.")
             else:
                 with st.spinner("엑셀에 사진을 삽입하는 중입니다..."):
                     res, ok, logs = insert_photos(ss.excel_bytes, slots, ss.assignments, ss.deletes, photo_map, fit)
-                ss.result_bytes = res
-                st.success(f"완료! 사진 {ok}개를 삽입했습니다.")
-                with st.expander("상세 처리 로그", expanded=True):
-                    for line in logs:
-                        st.text(line)
-    with b2:
-        if ss.result_bytes:
+                ss.excel_bytes = res            # 삽입 결과가 다음 시트 작업의 바탕이 됩니다
+                # 화면 목록도 현재 상태에 맞게 갱신 (다시 엑셀을 읽지 않음)
+                for i2, nm in ss.assignments.items():
+                    sl = slots[i2]
+                    if any(line.startswith(f"✓ [{sl['sheet']}!{sl['addr']}]") for line in logs):
+                        sl["existing"] = True
+                        sl["old_thumb"] = get_thumb(nm, photo_map[nm])
+                removed = []
+                for i2 in ss.deletes:
+                    if i2 in ss.assignments:
+                        continue
+                    sl = slots[i2]
+                    if sl["kind"] == "pic":
+                        removed.append(sl)
+                    else:
+                        sl["existing"], sl["old_thumb"] = False, None
+                if removed:
+                    ss.all_slots = [x for x in ss.all_slots if not any(x is r for r in removed)]
+                if ok:
+                    ss.done[sel] = ss.done.get(sel, 0) + ok
+                ss.ins_msg = f"'{sel}' 시트에 사진 {ok}개를 삽입했습니다. 아래 '▶ 다음 시트로'를 누르면 다음 시트로 넘어갑니다."
+                ss.ins_logs = logs
+                ss.assignments, ss.deletes, ss.pick_target = {}, set(), 0
+                bump()
+                st.rerun()
+        idx = ss.sheet_names.index(sel)
+        st.button("▶ 다음 시트로", on_click=next_sheet, disabled=idx >= len(ss.sheet_names) - 1)
+        if ss.done:
             out_name = f"{Path(ss.excel_name).stem}_사진삽입.xlsx"
             st.download_button(
-                f"💾 결과 파일 다운로드 ({out_name})", ss.result_bytes, file_name=out_name,
+                "💾 결과 저장 (다운로드)", ss.excel_bytes, file_name=out_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary",
             )
+            st.caption(f"지금까지 삽입한 {len(ss.done)}개 시트가 모두 들어 있습니다. 앱이 재시작되면 작업이 사라지니 중간중간 저장하세요.")
+
+        with st.expander("연결 현황 보기"):
+            for i2, sl in enumerate(slots):
+                nm = ss.assignments.get(i2)
+                state = f"✓ {nm}" if nm else ("🗑 기존 사진 삭제" if i2 in ss.deletes else ("기존 사진 유지" if sl["existing"] else "비어 있음"))
+                st.text(f"{i2 + 1:>2}. [{sl['sheet']}!{sl['addr']}] {state}")
+
+    # ───────────── 오른쪽: 사진 고르기 (스크롤 창, 2열) ─────────────
+    with right:
+        used = set(ss.assignments.values())
+        hide_used = st.checkbox("사용한 사진 숨기기", value=True, key="hide_used")
+        st.checkbox("넣은 뒤 다음 빈 칸으로 이동", value=True, key="auto_next")
+        pool = [n for n in photo_names if not (hide_used and n in used)]
+        st.subheader(f"사진 고르기 — 남은 {len(pool)}장 / 전체 {len(photo_names)}장")
+        if not photo_names:
+            st.info("위 ③에서 이 시트의 점검 사진을 올리면 여기에 미리보기가 나타납니다.")
+        elif not pool:
+            st.info("남은 사진이 없습니다. '사용한 사진 숨기기'를 끄면 모든 사진이 보입니다.")
+        else:
+            try:
+                pane = st.container(height=640)      # 이 안에서만 스크롤됩니다
+            except TypeError:
+                pane = st.container()
+            with pane:
+                shown = pool[: ss.show_n]
+                used_by = {v: k + 1 for k, v in ss.assignments.items()}
+                grid = st.columns(2)
+                for idx, n in enumerate(shown):
+                    with grid[idx % 2]:
+                        with st.container(border=True):
+                            t = get_thumb(n, photo_map[n], GRID_THUMB)
+                            if t:
+                                st.image(t)
+                            else:
+                                st.warning("미리보기를 만들 수 없는 사진입니다")
+                            st.caption(n)
+                            if n in used_by:
+                                st.success(f"✓ {used_by[n]}번 칸")
+                            st.button("선택", key=f"pickbtn_{idx}_{ss.ver}", on_click=pick_photo, args=(n,))
+                if len(pool) > len(shown):
+                    st.button(f"사진 더 보기 ({len(pool) - len(shown)}장 남음)", on_click=more_photos)
 
 
 if __name__ == "__main__":
