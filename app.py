@@ -429,17 +429,17 @@ def nav_css(cur: int, done, pending, deleting):
     st.markdown("<style>" + " ".join(rules) + "</style>", unsafe_allow_html=True)
 
 
-def next_sheet():
-    """삽입을 마친 뒤 다음 시트로 이동합니다. (사진 업로드 칸은 시트가 바뀔 때 자동으로 비워짐)"""
+def move_sheet(delta: int):
+    """이전(-1)/다음(+1) 시트로 이동합니다. (사진 업로드 칸은 시트가 바뀔 때 자동으로 비워짐)"""
     ss = st.session_state
     if ss.assignments or ss.deletes:
         ss.notice = "이 시트에 삽입하지 않은 연결이 있습니다. 먼저 '이 시트에 사진 삽입'을 누르거나 '연결 초기화'를 하세요."
         return
     names = ss.sheet_names
     if ss.get("sheet_sel") in names:
-        i = names.index(ss.sheet_sel)
-        if i + 1 < len(names):
-            ss.sheet_sel = names[i + 1]
+        k = names.index(ss.sheet_sel) + delta
+        if 0 <= k < len(names):
+            ss.sheet_sel = names[k]
 
 
 def get_thumb(name: str, data: bytes, size: int = THUMB) -> Optional[bytes]:
@@ -678,13 +678,17 @@ def main():
                     ss.all_slots = [x for x in ss.all_slots if not any(x is r for r in removed)]
                 if ok:
                     ss.done[sel] = ss.done.get(sel, 0) + ok
-                ss.ins_msg = f"'{sel}' 시트에 사진 {ok}개를 삽입했습니다. 아래 '▶ 다음 시트로'를 누르면 다음 시트로 넘어갑니다."
+                ss.ins_msg = f"'{sel}' 시트에 사진 {ok}개를 삽입했습니다. '▶ 다음 시트로'를 누르면 다음 시트로 넘어갑니다."
                 ss.ins_logs = logs
                 ss.assignments, ss.deletes, ss.pick_target = {}, set(), 0
                 bump()
                 st.rerun()
         idx = ss.sheet_names.index(sel)
-        st.button("▶ 다음 시트로", on_click=next_sheet, disabled=idx >= len(ss.sheet_names) - 1)
+        sb1, sb2 = st.columns(2)
+        with sb1:
+            st.button("◀ 이전 시트로", key="prev_sheet", on_click=move_sheet, args=(-1,), disabled=idx <= 0)
+        with sb2:
+            st.button("▶ 다음 시트로", key="next_sheet", on_click=move_sheet, args=(1,), disabled=idx >= len(ss.sheet_names) - 1)
         if ss.done:
             out_name = f"{Path(ss.excel_name).stem}_사진삽입.xlsx"
             st.download_button(
